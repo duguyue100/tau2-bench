@@ -90,12 +90,26 @@ def _generate_turn(
         request_body["tools"] = tools
         request_body["tool_choice"] = tool_choice
 
-    response = _http_json(
-        method="POST",
-        url=f"{endpoint_base.rstrip('/')}/v1/chat/completions",
-        body=request_body,
-        headers={"Authorization": f"Bearer {api_key}"},
-    )
+    url = f"{endpoint_base.rstrip('/')}/v1/chat/completions"
+    try:
+        response = _http_json(
+            method="POST",
+            url=url,
+            body=request_body,
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+    except RuntimeError as exc:
+        error_text = str(exc)
+        if "temperature" in error_text and "unsupported" in error_text.lower():
+            request_body.pop("temperature", None)
+            response = _http_json(
+                method="POST",
+                url=url,
+                body=request_body,
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+        else:
+            raise
     try:
         message = response["choices"][0]["message"]
     except Exception as exc:
