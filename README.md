@@ -231,6 +231,7 @@ It also supports a shared relay mode if you want to control **both** sides exter
 - `POST /v1/relay/agent/chat/completions`: submit the next agent turn.
 
 Relay responses include `next_turn` (`"user"` or `"agent"`) so your client can alternate calls correctly.
+Relay session creation (`/v1/relay/sessions`) also returns selected task context in `info` (policy, user scenario, and tool schemas), which external clients can use to ground model behavior.
 
 An end-to-end relay client example is available at `examples/relay_client.py`.
 

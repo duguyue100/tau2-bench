@@ -206,6 +206,16 @@ class FakeRelaySessionEngine:
     def start(self):
         return "assistant: hello", "user"
 
+    def get_bootstrap_info(self):
+        return {
+            "domain": self.domain,
+            "task_id": self.task_id,
+            "policy": "fake-policy",
+            "user_scenario": "fake-user-scenario",
+            "agent_tools": [],
+            "user_tools": [],
+        }
+
     def step(self, turn: str, action: str):
         if turn != self.expected_turn:
             raise RuntimeError(f"It is not the {turn}'s turn")

@@ -25,8 +25,6 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-from tau2.registry import registry
-
 
 def _http_json(
     method: str,
@@ -63,6 +61,14 @@ def _parse_observation(observation: str) -> list[dict[str, str]]:
             continue
         role, content = line.split(":", 1)
         role = role.strip().lower()
+        if role == "tool":
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": f"[Tool result] {content.strip()}",
+                }
+            )
+            continue
         if role not in {"system", "user", "assistant"}:
             continue
         messages.append({"role": role, "content": content.strip()})
@@ -133,19 +139,6 @@ def _generate_turn(
     return result
 
 
-def _load_domain_metadata(
-    domain: str,
-) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
-    env = registry.get_env_constructor(domain)()
-    policy = env.get_policy()
-    agent_tools = [tool.openai_schema for tool in env.get_tools()]
-    try:
-        user_tools = [tool.openai_schema for tool in (env.get_user_tools() or [])]
-    except ValueError:
-        user_tools = []
-    return policy, agent_tools, user_tools
-
-
 def _require_env(name: str) -> str:
     value = os.getenv(name)
     if not value:
@@ -201,21 +194,19 @@ def main() -> int:
         "--include-domain-policy",
         action="store_true",
         default=False,
-        help="Append tau2 domain policy text to both system prompts.",
+        help="Append tau2 domain policy text from relay session info.",
+    )
+    parser.add_argument(
+        "--no-include-user-scenario",
+        action="store_true",
+        default=False,
+        help="Append selected task user scenario from relay session info.",
     )
 
     args = parser.parse_args()
 
     user_api_key = _require_env(args.user_api_key_env)
     agent_api_key = _require_env(args.agent_api_key_env)
-    domain_policy, agent_tools, user_tools = _load_domain_metadata(args.domain)
-
-    user_system_prompt = args.user_system_prompt
-    agent_system_prompt = args.agent_system_prompt
-    if args.include_domain_policy:
-        policy_block = f"\n\nDomain policy:\n{domain_policy}"
-        user_system_prompt += policy_block
-        agent_system_prompt += policy_block
 
     create_body: dict[str, Any] = {
         "domain": args.domain,
@@ -235,12 +226,40 @@ def main() -> int:
     session_id = create_response["session_id"]
     next_turn = create_response.get("next_turn", "user")
     observation = create_response.get("initial_observation", "")
+    info = create_response.get("info", {})
+
+    domain_policy = info.get("policy") if isinstance(info, dict) else None
+    user_scenario = info.get("user_scenario") if isinstance(info, dict) else None
+    agent_tools = info.get("agent_tools") if isinstance(info, dict) else None
+    user_tools = info.get("user_tools") if isinstance(info, dict) else None
+    if not isinstance(agent_tools, list):
+        agent_tools = []
+    if not isinstance(user_tools, list):
+        user_tools = []
+
+    user_system_prompt = args.user_system_prompt
+    agent_system_prompt = args.agent_system_prompt
+    if args.include_domain_policy and isinstance(domain_policy, str) and domain_policy:
+        policy_block = f"\n\nDomain policy:\n{domain_policy}"
+        user_system_prompt += policy_block
+        agent_system_prompt += policy_block
+    if (
+        (not args.no_include_user_scenario)
+        and isinstance(user_scenario, str)
+        and user_scenario
+    ):
+        user_system_prompt += f"\n\nSelected task user scenario:\n{user_scenario}"
+        agent_system_prompt += (
+            f"\n\nSelected task user scenario (for grounding only):\n{user_scenario}"
+        )
 
     print(f"relay session: {session_id}")
     print(f"initial next_turn: {next_turn}")
 
     terminated = False
     reward = 0.0
+    repeated_agent_tool_name = None
+    repeated_agent_tool_count = 0
     try:
         for turn_idx in range(1, args.max_turns + 1):
             if terminated:
@@ -272,21 +291,36 @@ def main() -> int:
                     },
                 )
             elif next_turn == "agent":
+                effective_agent_tool_choice = args.agent_tool_choice
+                effective_agent_system_prompt = agent_system_prompt
+                if repeated_agent_tool_count >= 2:
+                    effective_agent_tool_choice = "none"
+                    effective_agent_system_prompt += (
+                        "\n\nYou have already called the same tool multiple times. "
+                        "Now provide a direct assistant response to the user instead of another tool call."
+                    )
                 generated = _generate_turn(
                     endpoint_base=args.agent_endpoint_base,
                     api_key=agent_api_key,
                     model=args.agent_model,
                     messages=history,
-                    system_prompt=agent_system_prompt,
+                    system_prompt=effective_agent_system_prompt,
                     temperature=args.agent_temperature,
                     tools=agent_tools,
-                    tool_choice=args.agent_tool_choice,
+                    tool_choice=effective_agent_tool_choice,
                 )
                 if generated.get("tool_calls"):
                     tool_name = generated["tool_calls"][0]["function"]["name"]
                     print(f"[{turn_idx}] agent -> tool_call:{tool_name}")
+                    if repeated_agent_tool_name == tool_name:
+                        repeated_agent_tool_count += 1
+                    else:
+                        repeated_agent_tool_name = tool_name
+                        repeated_agent_tool_count = 1
                 else:
                     print(f"[{turn_idx}] agent -> {generated['content']}")
+                    repeated_agent_tool_name = None
+                    repeated_agent_tool_count = 0
                 agent_message = {"role": "assistant", **generated}
                 relay_response = _http_json(
                     method="POST",

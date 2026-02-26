@@ -131,14 +131,16 @@ class RelaySessionEngine:
 
         self._environment = registry.get_env_constructor(domain)()
         self._task = self._get_task(domain=domain, task_id=task_id)
+        self._agent_tools = self._environment.get_tools()
         self._agent = GymAgent(
-            tools=self._environment.get_tools(),
+            tools=self._agent_tools,
             domain_policy=self._environment.get_policy(),
         )
         try:
             user_tools = self._environment.get_user_tools()
         except ValueError:
             user_tools = None
+        self._user_tools = user_tools or []
         self._user = GymUser(
             tools=user_tools,
             instructions=self._task.user_scenario,
@@ -160,6 +162,16 @@ class RelaySessionEngine:
             if task.id == task_id:
                 return task
         raise ValueError(f"No task found with id {task_id} for domain {domain}")
+
+    def get_bootstrap_info(self) -> dict[str, Any]:
+        return {
+            "domain": self.domain,
+            "task_id": self.task_id,
+            "policy": self._environment.get_policy(),
+            "user_scenario": str(self._task.user_scenario),
+            "agent_tools": [tool.openai_schema for tool in self._agent_tools],
+            "user_tools": [tool.openai_schema for tool in self._user_tools],
+        }
 
     def start(self) -> tuple[str, RelayTurn]:
         with self._lock:
@@ -526,7 +538,7 @@ class SessionManager:
             initial_message=_extract_last_turn(
                 initial_observation, default_role="assistant"
             ),
-            info={"relay": True},
+            info={"relay": True, **engine.get_bootstrap_info()},
             full_observation=request.full_observation,
             next_turn=next_turn,
         )
