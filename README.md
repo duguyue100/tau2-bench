@@ -211,6 +211,9 @@ tau2 chat-server --host 127.0.0.1 --port 8005 --config interactive_chat_server.e
 Config format is demonstrated in `interactive_chat_server.example.toml`. The server applies defaults from:
 - `[agent_session_defaults]` for `POST /v1/agent/sessions`
 - `[user_session_defaults]` for `POST /v1/user/sessions`
+- `[relay_session_defaults]` for `POST /v1/relay/sessions`
+
+In relay mode, `agent_llm`/`user_llm` defaults are ignored because both turns are supplied externally.
 
 Any values sent in the session creation request override config defaults.
 

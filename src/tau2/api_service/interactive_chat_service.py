@@ -284,6 +284,7 @@ class SessionDefaults(BaseModel):
 class InteractiveChatServiceConfig(BaseModel):
     agent_session_defaults: SessionDefaults = Field(default_factory=SessionDefaults)
     user_session_defaults: SessionDefaults = Field(default_factory=SessionDefaults)
+    relay_session_defaults: SessionDefaults = Field(default_factory=SessionDefaults)
 
 
 def _extract_last_turn(observation: str, default_role: ChatRole) -> OpenAIMessage:
@@ -362,14 +363,15 @@ class SessionManager:
 
     def _resolve_request(
         self,
-        mode: SessionMode,
+        mode: SessionMode | Literal["relay"],
         request: SessionCreateRequest,
     ) -> SessionCreateRequest:
-        defaults = (
-            self._config.agent_session_defaults
-            if mode == "agent"
-            else self._config.user_session_defaults
-        )
+        if mode == "agent":
+            defaults = self._config.agent_session_defaults
+        elif mode == "user":
+            defaults = self._config.user_session_defaults
+        else:
+            defaults = self._config.relay_session_defaults
         default_values = defaults.model_dump()
         request_values = request.model_dump(exclude_none=True)
         merged = {**default_values, **request_values}
@@ -487,7 +489,7 @@ class SessionManager:
     def create_relay_session(
         self, request: SessionCreateRequest
     ) -> SessionCreateResponse:
-        request = self._resolve_request(mode="user", request=request)
+        request = self._resolve_request(mode="relay", request=request)
         assert request.domain is not None
         assert request.task_split_name is not None
         assert request.max_steps is not None

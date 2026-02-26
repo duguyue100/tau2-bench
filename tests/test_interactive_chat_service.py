@@ -178,6 +178,10 @@ task_id = "create_task_1"
 [user_session_defaults]
 domain = "mock"
 agent_llm = "gpt-4.1"
+
+[relay_session_defaults]
+domain = "mock"
+task_id = "create_task_1"
 """.strip(),
         encoding="utf-8",
     )
@@ -186,6 +190,7 @@ agent_llm = "gpt-4.1"
     assert config.agent_session_defaults.domain == "mock"
     assert config.agent_session_defaults.task_id == "create_task_1"
     assert config.user_session_defaults.agent_llm == "gpt-4.1"
+    assert config.relay_session_defaults.task_id == "create_task_1"
 
 
 class FakeRelaySessionEngine:
@@ -267,3 +272,28 @@ def test_relay_wrong_turn_returns_conflict(monkeypatch):
         },
     )
     assert response.status_code == 409
+
+
+def test_relay_uses_relay_defaults(monkeypatch):
+    monkeypatch.setattr(service, "RelaySessionEngine", FakeRelaySessionEngine)
+    service.session_manager.update_config(
+        service.InteractiveChatServiceConfig(
+            relay_session_defaults=service.SessionDefaults(
+                domain="mock",
+                task_id="create_task_1",
+                max_steps=77,
+                full_observation=False,
+            )
+        )
+    )
+    client = TestClient(service.app)
+
+    create_response = client.post("/v1/relay/sessions", json={})
+    assert create_response.status_code == 200
+    create_data = create_response.json()
+    assert create_data["domain"] == "mock"
+    assert create_data["task_id"] == "create_task_1"
+    assert create_data["full_observation"] is False
+
+    relay_session = service.session_manager._relay_sessions[create_data["session_id"]]
+    assert relay_session.engine.max_steps == 77
