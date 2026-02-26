@@ -1,6 +1,14 @@
+import pytest
 from fastapi.testclient import TestClient
 
 from tau2.api_service import interactive_chat_service as service
+
+
+@pytest.fixture(autouse=True)
+def reset_session_manager_state():
+    service.session_manager._sessions.clear()
+    service.session_manager._relay_sessions.clear()
+    service.session_manager.update_config(service.InteractiveChatServiceConfig())
 
 
 class FakeAgentGymEnv:
@@ -42,6 +50,10 @@ def test_agent_session_and_chat(monkeypatch):
     assert create_data["initial_message"]["role"] == "user"
 
     session_id = create_data["session_id"]
+    session = service.session_manager._sessions[session_id]
+    env_kwargs = getattr(session.env, "kwargs", {})
+    assert env_kwargs["all_messages_as_observation"] is True
+
     completion_response = client.post(
         "/v1/agent/chat/completions",
         json={
@@ -66,6 +78,9 @@ def test_user_session_and_tool_call_chat(monkeypatch):
     assert create_response.status_code == 200
     create_data = create_response.json()
     session_id = create_data["session_id"]
+    session = service.session_manager._sessions[session_id]
+    env_kwargs = getattr(session.env, "kwargs", {})
+    assert env_kwargs["all_messages_as_observation"] is True
 
     completion_response = client.post(
         "/v1/user/chat/completions",
@@ -94,7 +109,161 @@ def test_user_session_and_tool_call_chat(monkeypatch):
     assert "check_status" in completion_data["observation"]
 
 
+def test_session_can_disable_full_observation(monkeypatch):
+    monkeypatch.setattr(service, "AgentGymEnv", FakeAgentGymEnv)
+    client = TestClient(service.app)
+
+    create_response = client.post(
+        "/v1/agent/sessions",
+        json={
+            "domain": "mock",
+            "task_id": "create_task_1",
+            "full_observation": False,
+        },
+    )
+    assert create_response.status_code == 200
+    create_data = create_response.json()
+    assert create_data["full_observation"] is False
+
+    session_id = create_data["session_id"]
+    session = service.session_manager._sessions[session_id]
+    env_kwargs = getattr(session.env, "kwargs", {})
+    assert env_kwargs["all_messages_as_observation"] is False
+
+
 def test_delete_unknown_session():
     client = TestClient(service.app)
     response = client.delete("/v1/sessions/does-not-exist")
     assert response.status_code == 404
+
+
+def test_config_defaults_can_define_domain_and_models(monkeypatch):
+    monkeypatch.setattr(service, "AgentGymEnv", FakeAgentGymEnv)
+    service.session_manager.update_config(
+        service.InteractiveChatServiceConfig(
+            agent_session_defaults=service.SessionDefaults(
+                domain="mock",
+                task_id="create_task_1",
+                user_llm="config-user-model",
+                user_llm_args={"temperature": 0.2},
+                full_observation=False,
+            )
+        )
+    )
+    client = TestClient(service.app)
+
+    create_response = client.post("/v1/agent/sessions", json={})
+    assert create_response.status_code == 200
+    create_data = create_response.json()
+    assert create_data["domain"] == "mock"
+    assert create_data["task_id"] == "create_task_1"
+    assert create_data["full_observation"] is False
+
+    session_id = create_data["session_id"]
+    session = service.session_manager._sessions[session_id]
+    env_kwargs = getattr(session.env, "kwargs", {})
+    assert env_kwargs["user_llm"] == "config-user-model"
+    assert env_kwargs["user_llm_args"] == {"temperature": 0.2}
+    assert env_kwargs["all_messages_as_observation"] is False
+
+
+def test_load_service_config_from_toml(tmp_path):
+    config_path = tmp_path / "interactive_chat.toml"
+    config_path.write_text(
+        """
+[agent_session_defaults]
+domain = "mock"
+task_id = "create_task_1"
+
+[user_session_defaults]
+domain = "mock"
+agent_llm = "gpt-4.1"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = service.load_service_config(str(config_path))
+    assert config.agent_session_defaults.domain == "mock"
+    assert config.agent_session_defaults.task_id == "create_task_1"
+    assert config.user_session_defaults.agent_llm == "gpt-4.1"
+
+
+class FakeRelaySessionEngine:
+    def __init__(
+        self, domain: str, task_id: str, max_steps: int, full_observation: bool
+    ):
+        self.domain = domain
+        self.task_id = task_id
+        self.max_steps = max_steps
+        self.full_observation = full_observation
+        self.expected_turn = "user"
+
+    def start(self):
+        return "assistant: hello", "user"
+
+    def step(self, turn: str, action: str):
+        if turn != self.expected_turn:
+            raise RuntimeError(f"It is not the {turn}'s turn")
+        if turn == "user":
+            self.expected_turn = "agent"
+            return f"assistant: got {action}", False, 0.0, "agent"
+        self.expected_turn = "user"
+        return f"user: got {action}", False, 0.0, "user"
+
+
+def test_relay_session_ping_pong(monkeypatch):
+    monkeypatch.setattr(service, "RelaySessionEngine", FakeRelaySessionEngine)
+    client = TestClient(service.app)
+
+    create_response = client.post(
+        "/v1/relay/sessions",
+        json={"domain": "mock", "task_id": "create_task_1"},
+    )
+    assert create_response.status_code == 200
+    create_data = create_response.json()
+    assert create_data["next_turn"] == "user"
+
+    session_id = create_data["session_id"]
+    user_step_response = client.post(
+        "/v1/relay/user/chat/completions",
+        json={
+            "session_id": session_id,
+            "messages": [{"role": "user", "content": "hello agent"}],
+        },
+    )
+    assert user_step_response.status_code == 200
+    user_step_data = user_step_response.json()
+    assert user_step_data["next_turn"] == "agent"
+    assert user_step_data["choices"][0]["message"]["role"] == "assistant"
+
+    agent_step_response = client.post(
+        "/v1/relay/agent/chat/completions",
+        json={
+            "session_id": session_id,
+            "messages": [{"role": "assistant", "content": "hello user"}],
+        },
+    )
+    assert agent_step_response.status_code == 200
+    agent_step_data = agent_step_response.json()
+    assert agent_step_data["next_turn"] == "user"
+    assert agent_step_data["choices"][0]["message"]["role"] == "user"
+
+
+def test_relay_wrong_turn_returns_conflict(monkeypatch):
+    monkeypatch.setattr(service, "RelaySessionEngine", FakeRelaySessionEngine)
+    client = TestClient(service.app)
+
+    create_response = client.post(
+        "/v1/relay/sessions",
+        json={"domain": "mock", "task_id": "create_task_1"},
+    )
+    session_id = create_response.json()["session_id"]
+
+    response = client.post(
+        "/v1/relay/agent/chat/completions",
+        json={
+            "session_id": session_id,
+            "messages": [{"role": "assistant", "content": "out of turn"}],
+        },
+    )
+    assert response.status_code == 409

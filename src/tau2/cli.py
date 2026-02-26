@@ -237,6 +237,12 @@ def main():
         default=8005,
         help="Port for the interactive chat API server.",
     )
+    chat_server_parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to interactive chat server config file (.json/.yaml/.yml/.toml).",
+    )
     chat_server_parser.set_defaults(func=lambda args: run_chat_server(args))
 
     # Check data command
@@ -360,7 +366,7 @@ def run_start_servers():
 def run_chat_server(args):
     from tau2.api_service.interactive_chat_service import main as chat_server_main
 
-    chat_server_main(host=args.host, port=args.port)
+    chat_server_main(host=args.host, port=args.port, config_path=args.config)
 
 
 def run_check_data():

@@ -202,12 +202,34 @@ If you want to drive the conversation step-by-step yourself (instead of running 
 tau2 chat-server --host 127.0.0.1 --port 8005
 ```
 
+You can also load default agent/user configuration from a file:
+
+```bash
+tau2 chat-server --host 127.0.0.1 --port 8005 --config interactive_chat_server.example.toml
+```
+
+Config format is demonstrated in `interactive_chat_server.example.toml`. The server applies defaults from:
+- `[agent_session_defaults]` for `POST /v1/agent/sessions`
+- `[user_session_defaults]` for `POST /v1/user/sessions`
+
+Any values sent in the session creation request override config defaults.
+
 This service provides two OpenAI-like chat endpoints with in-memory sessions:
 
 - `POST /v1/agent/sessions`: create a session where **you control the agent** and tau2 runs the user simulator.
 - `POST /v1/user/sessions`: create a session where **you control the user** and tau2 runs the LLM agent.
 - `POST /v1/agent/chat/completions`: advance an agent-controlled session by one step.
 - `POST /v1/user/chat/completions`: advance a user-controlled session by one step.
+
+It also supports a shared relay mode if you want to control **both** sides externally:
+
+- `POST /v1/relay/sessions`: create one shared session (single conversation state).
+- `POST /v1/relay/user/chat/completions`: submit the next user turn.
+- `POST /v1/relay/agent/chat/completions`: submit the next agent turn.
+
+Relay responses include `next_turn` (`"user"` or `"agent"`) so your client can alternate calls correctly.
+
+An end-to-end relay client example is available at `examples/relay_client.py`.
 
 Create an agent-controlled session:
 
@@ -237,6 +259,8 @@ Notes:
 - Endpoints are stateful by `session_id` and keep simulation state in memory.
 - `stream=true` is not supported.
 - For tool calls, provide OpenAI-style `tool_calls` in the last message (one tool call per step).
+- Session creation accepts `full_observation` (default `true`). Set it to `false` to return compact observations instead of full transcript history.
+- If you configure defaults via `--config`, you can inspect active defaults at `GET /v1/config`.
 
 ## Leaderboard Submission
 

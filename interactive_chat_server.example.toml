@@ -1,0 +1,32 @@
+[agent_session_defaults]
+# You control the agent; tau2 controls the simulated user.
+domain = "retail"
+task_split_name = "base"
+# task_id = "<optional-specific-task-id>"
+max_steps = 100
+# Model used by the simulated user in /v1/agent/sessions
+# Any LiteLLM-compatible model name is valid (for example: gpt-5-mini, claude-sonnet-4-5, gemini-2.5-pro)
+user_llm = "gpt-5-mini"
+full_observation = true
+
+[agent_session_defaults.user_llm_args]
+# Common generation params
+temperature = 0.7
+max_completion_tokens = 1200
+# OpenAI reasoning models (optional)
+reasoning_effort = "medium"
+
+[user_session_defaults]
+# You control the user; tau2 controls the customer service agent.
+domain = "retail"
+task_split_name = "base"
+# task_id = "<optional-specific-task-id>"
+max_steps = 100
+# Model used by the customer-service agent in /v1/user/sessions
+agent_llm = "gpt-5"
+full_observation = true
+
+[user_session_defaults.agent_llm_args]
+temperature = 0.1
+max_completion_tokens = 2000
+reasoning_effort = "high"
