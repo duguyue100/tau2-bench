@@ -194,6 +194,50 @@ tau2 check-data
 ```
 This command checks if your data directory is properly configured and all required files are present.
 
+### Interactive agent/user chat API
+
+If you want to drive the conversation step-by-step yourself (instead of running full `tau2 run`), start the interactive chat API:
+
+```bash
+tau2 chat-server --host 127.0.0.1 --port 8005
+```
+
+This service provides two OpenAI-like chat endpoints with in-memory sessions:
+
+- `POST /v1/agent/sessions`: create a session where **you control the agent** and tau2 runs the user simulator.
+- `POST /v1/user/sessions`: create a session where **you control the user** and tau2 runs the LLM agent.
+- `POST /v1/agent/chat/completions`: advance an agent-controlled session by one step.
+- `POST /v1/user/chat/completions`: advance a user-controlled session by one step.
+
+Create an agent-controlled session:
+
+```bash
+curl -X POST http://127.0.0.1:8005/v1/agent/sessions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "domain": "mock",
+    "task_id": "create_task_1"
+  }'
+```
+
+Advance one step (agent message -> user response):
+
+```bash
+curl -X POST http://127.0.0.1:8005/v1/agent/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "session_id": "session-...",
+    "messages": [
+      {"role": "assistant", "content": "Hello! How can I help you today?"}
+    ]
+  }'
+```
+
+Notes:
+- Endpoints are stateful by `session_id` and keep simulation state in memory.
+- `stream=true` is not supported.
+- For tool calls, provide OpenAI-style `tool_calls` in the last message (one tool call per step).
+
 ## Leaderboard Submission
 
 To submit your agent results to the τ²-bench leaderboard, you need to prepare a valid submission package that meets specific requirements.
