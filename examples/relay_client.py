@@ -180,14 +180,16 @@ def main() -> int:
         "--user-system-prompt",
         default=(
             "You are the end user in a customer support chat. "
-            "Respond naturally as the user, concise but realistic."
+            "Respond naturally as the user, concise but realistic. "
+            "If your issue is fully resolved, reply with exactly ###STOP###."
         ),
     )
     parser.add_argument(
         "--agent-system-prompt",
         default=(
             "You are the customer support agent. "
-            "Help the user resolve their issue and follow policy."
+            "Help the user resolve their issue and follow policy. "
+            "Use available tools when needed. When the issue is resolved, call the done tool."
         ),
     )
     parser.add_argument(
@@ -201,6 +203,12 @@ def main() -> int:
         action="store_true",
         default=False,
         help="Append selected task user scenario from relay session info.",
+    )
+    parser.add_argument(
+        "--include-user-scenario-for-agent",
+        action="store_true",
+        default=False,
+        help="Also append task user scenario to the agent prompt.",
     )
 
     args = parser.parse_args()
@@ -249,17 +257,17 @@ def main() -> int:
         and user_scenario
     ):
         user_system_prompt += f"\n\nSelected task user scenario:\n{user_scenario}"
-        agent_system_prompt += (
-            f"\n\nSelected task user scenario (for grounding only):\n{user_scenario}"
-        )
+        if args.include_user_scenario_for_agent:
+            agent_system_prompt += (
+                "\n\nSelected task user scenario (for grounding only):\n"
+                f"{user_scenario}"
+            )
 
     print(f"relay session: {session_id}")
     print(f"initial next_turn: {next_turn}")
 
     terminated = False
     reward = 0.0
-    repeated_agent_tool_name = None
-    repeated_agent_tool_count = 0
     try:
         for turn_idx in range(1, args.max_turns + 1):
             if terminated:
@@ -291,36 +299,21 @@ def main() -> int:
                     },
                 )
             elif next_turn == "agent":
-                effective_agent_tool_choice = args.agent_tool_choice
-                effective_agent_system_prompt = agent_system_prompt
-                if repeated_agent_tool_count >= 2:
-                    effective_agent_tool_choice = "none"
-                    effective_agent_system_prompt += (
-                        "\n\nYou have already called the same tool multiple times. "
-                        "Now provide a direct assistant response to the user instead of another tool call."
-                    )
                 generated = _generate_turn(
                     endpoint_base=args.agent_endpoint_base,
                     api_key=agent_api_key,
                     model=args.agent_model,
                     messages=history,
-                    system_prompt=effective_agent_system_prompt,
+                    system_prompt=agent_system_prompt,
                     temperature=args.agent_temperature,
                     tools=agent_tools,
-                    tool_choice=effective_agent_tool_choice,
+                    tool_choice=args.agent_tool_choice,
                 )
                 if generated.get("tool_calls"):
                     tool_name = generated["tool_calls"][0]["function"]["name"]
                     print(f"[{turn_idx}] agent -> tool_call:{tool_name}")
-                    if repeated_agent_tool_name == tool_name:
-                        repeated_agent_tool_count += 1
-                    else:
-                        repeated_agent_tool_name = tool_name
-                        repeated_agent_tool_count = 1
                 else:
                     print(f"[{turn_idx}] agent -> {generated['content']}")
-                    repeated_agent_tool_name = None
-                    repeated_agent_tool_count = 0
                 agent_message = {"role": "assistant", **generated}
                 relay_response = _http_json(
                     method="POST",
