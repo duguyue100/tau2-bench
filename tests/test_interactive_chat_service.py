@@ -2,6 +2,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from tau2.api_service import interactive_chat_service as service
+from tau2.data_model.message import AssistantMessage, UserMessage
 
 
 @pytest.fixture(autouse=True)
@@ -307,3 +308,52 @@ def test_relay_uses_relay_defaults(monkeypatch):
 
     relay_session = service.session_manager._relay_sessions[create_data["session_id"]]
     assert relay_session.engine.max_steps == 77
+
+
+class _FakeTerminationReason:
+    value = "agent_stop"
+
+
+class _FakeRewardInfo:
+    reward = 1.0
+
+
+class _FakeSimulation:
+    def __init__(self):
+        self.messages = [
+            AssistantMessage(role="assistant", content="Hi!"),
+            UserMessage(role="user", content="Need help"),
+        ]
+        self.termination_reason = _FakeTerminationReason()
+        self.reward_info = _FakeRewardInfo()
+
+    def model_dump(self, mode: str = "json"):
+        return {"termination_reason": "agent_stop", "messages": []}
+
+
+def test_run_simulation_endpoint(monkeypatch):
+    monkeypatch.setattr(
+        service,
+        "get_tasks",
+        lambda task_set_name, task_split_name, task_ids=None, num_tasks=None: [
+            type("TaskObj", (), {"id": "create_task_1"})()
+        ],
+    )
+    monkeypatch.setattr(service, "run_task", lambda **kwargs: _FakeSimulation())
+    client = TestClient(service.app)
+
+    response = client.post(
+        "/v1/simulations/runs",
+        json={
+            "domain": "mock",
+            "task_id": "create_task_1",
+            "agent_llm": "gpt-4o-mini-2024-07-18",
+            "user_llm": "gpt-4o-mini-2024-07-18",
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["task_id"] == "create_task_1"
+    assert data["terminated"] is True
+    assert data["reward"] == 1.0
+    assert len(data["transcript"]) == 2

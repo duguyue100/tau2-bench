@@ -233,6 +233,10 @@ It also supports a shared relay mode if you want to control **both** sides exter
 Relay responses include `next_turn` (`"user"` or `"agent"`) so your client can alternate calls correctly.
 Relay session creation (`/v1/relay/sessions`) also returns selected task context in `info` (policy, user scenario, and tool schemas), which external clients can use to ground model behavior.
 
+If you want endpoint behavior equivalent to `tau2 run` (both agent and user generated internally by tau2), use:
+
+- `POST /v1/simulations/runs`: run a full simulation and return transcript + reward in one response.
+
 An end-to-end relay client example is available at `examples/relay_client.py`.
 
 Create an agent-controlled session:
