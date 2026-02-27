@@ -188,6 +188,89 @@ Visit http://127.0.0.1:8004/redoc to see the domain policy and API documentation
 
 ![domain_viewer1](figs/domain_viewer.png)
 
+### Chat Server
+
+The chat server exposes τ²-bench over HTTP so you can drive conversations turn-by-turn from any language or framework — without running a full automated simulation.
+
+#### Start the server
+
+```bash
+tau2 chat-server \
+  --domain retail \
+  --agent-llm gpt-4.1 \
+  --user-llm gpt-4.1
+```
+
+Default host/port is `127.0.0.1:8002`. Override with `--host` and `--port`.
+
+Sessions are automatically evicted after `--session-ttl` seconds of inactivity (default: 3600). Set `--session-ttl 0` to disable auto-eviction.
+
+Once running, interactive API docs are available at **http://127.0.0.1:8002/docs**.
+
+#### Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/health` | Health check |
+| `GET` | `/config` | Active server configuration |
+| `POST` | `/v1/session` | Create a session (initialises the domain environment for a task) |
+| `DELETE` | `/v1/session/{session_id}` | Destroy a session |
+| `POST` | `/v1/agent/turn` | **Full agent turn** — LLM → tool calls → LLM → … resolved server-side |
+| `POST` | `/v1/agent/chat/completions` | Single LLM call for the agent (may return `finish_reason: tool_calls`) |
+| `POST` | `/v1/tool/execute` | Execute tool calls against a session's live environment |
+| `POST` | `/v1/user/chat/completions` | Generate the next user simulator message |
+
+#### Typical flow using `/v1/agent/turn` (recommended)
+
+```
+POST /v1/session          {"task_id": "3"}
+ → {"session_id": "..."}
+
+POST /v1/agent/turn       {"session_id": "...", "messages": []}
+ → agent greeting
+
+loop:
+  POST /v1/user/chat/completions  {"session_id": "...", "task_id": "3", "messages": [...]}
+   → user message
+
+  POST /v1/agent/turn     {"session_id": "...", "messages": [...]}
+   → {steps: [{tool_calls, tool_results}, ...], final_message, is_stop}
+     (all tool-call rounds resolved on the server — one call per turn)
+
+  if is_stop → break
+
+DELETE /v1/session/{session_id}
+```
+
+`/v1/agent/turn` handles the full `LLM → tool execute → LLM → …` loop internally and returns:
+- `steps` — each intermediate tool-call/result round (empty when no tools were called)
+- `final_message` — the agent's concluding text message
+- `is_stop` — `True` when the message contains a stop signal (`###STOP###` or `###TRANSFER###`)
+
+Append `steps[*].tool_calls + steps[*].tool_results + final_message` to your history after each call.
+
+#### Fine-grained control
+
+If you need to handle tool execution yourself (e.g. to swap in a real backend), use the lower-level endpoints instead:
+
+```
+POST /v1/agent/chat/completions  → may return finish_reason: "tool_calls"
+POST /v1/tool/execute            → execute those tool calls, get role="tool" results back
+POST /v1/agent/chat/completions  → continue until finish_reason: "stop"
+```
+
+#### Example script
+
+A complete end-to-end simulation script is provided:
+
+```bash
+python examples/simulate_conversation.py --task-id 3
+python examples/simulate_conversation.py --task-id 6
+python examples/simulate_conversation.py --scenario "I want to cancel my order."
+```
+
+Pass `--base-url` to point at a remote server, and `--max-turns` to cap the conversation length.
+
 ### Check data configuration
 ```bash
 tau2 check-data
