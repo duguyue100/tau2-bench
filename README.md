@@ -203,6 +203,8 @@ tau2 chat-server \
 
 Default host/port is `127.0.0.1:8002`. Override with `--host` and `--port`.
 
+Sessions are automatically evicted after `--session-ttl` seconds of inactivity (default: 3600). Set `--session-ttl 0` to disable auto-eviction.
+
 Once running, interactive API docs are available at **http://127.0.0.1:8002/docs**.
 
 #### Endpoints

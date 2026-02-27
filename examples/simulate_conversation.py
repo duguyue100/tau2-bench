@@ -10,6 +10,12 @@ Then run this script:
     python examples/simulate_conversation.py --task-id 3
     python examples/simulate_conversation.py --scenario "I want to cancel my flight."
 
+To demonstrate TTL-based session eviction, start the server with a short TTL
+and pass --wait-for-eviction to this script:
+    tau2 chat-server --domain airline --agent-llm gpt-4o-mini --user-llm gpt-4o-mini \\
+        --session-ttl 10
+    python examples/simulate_conversation.py --task-id 3 --wait-for-eviction
+
 Conversation flow
 -----------------
 1. POST /v1/session        {"task_id": "3"}
@@ -29,12 +35,14 @@ Conversation flow
 
 5. Repeat from step 3 until is_stop == True or max turns reached.
 
-6. DELETE /v1/session/{session_id}
+6. Session is left to expire via server-side TTL.  Use GET /v1/session/{id}
+   to check whether it is still alive (200 = alive, 404 = evicted / gone).
 """
 
 import argparse
-import json
 import sys
+import time
+import json
 
 import requests
 
@@ -59,8 +67,15 @@ def create_session(base_url: str, task_id: str) -> str:
     return data["session_id"]
 
 
-def delete_session(base_url: str, session_id: str) -> None:
-    requests.delete(f"{base_url}/v1/session/{session_id}", timeout=10)
+def session_alive(base_url: str, session_id: str) -> bool:
+    """Return True if the session exists on the server, False if it is gone."""
+    resp = requests.get(f"{base_url}/v1/session/{session_id}", timeout=10)
+    if resp.status_code == 200:
+        return True
+    if resp.status_code == 404:
+        return False
+    resp.raise_for_status()
+    return False  # unreachable
 
 
 def call_agent_turn(base_url: str, session_id: str, messages: list[dict]) -> dict:
@@ -159,11 +174,53 @@ def history_from_agent_turn(turn: dict) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
+def wait_for_eviction(
+    base_url: str,
+    session_id: str,
+    poll_interval: float = 2.0,
+    timeout: float = 120.0,
+) -> bool:
+    """
+    Poll GET /v1/session/{session_id} until it returns 404 (evicted) or
+    *timeout* seconds elapse.
+
+    Returns True if the session was evicted, False if it was still alive after
+    *timeout* seconds.
+    """
+    deadline = time.time() + timeout
+    print(
+        f"\n[Waiting for TTL eviction of session {session_id} "
+        f"(polling every {poll_interval:.0f}s, timeout {timeout:.0f}s)...]"
+    )
+    while time.time() < deadline:
+        alive = session_alive(base_url, session_id)
+        if not alive:
+            print(
+                f"[Session {session_id} has been evicted by the server (TTL expired)]"
+            )
+            return True
+        remaining = deadline - time.time()
+        print(
+            f"  Session still alive. Checking again in {poll_interval:.0f}s "
+            f"({remaining:.0f}s remaining)..."
+        )
+        time.sleep(poll_interval)
+    print(f"[Timeout: session {session_id} is still alive after {timeout:.0f}s]")
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Main simulation loop
+# ---------------------------------------------------------------------------
+
+
 def simulate(
     task_id: str | None,
     scenario: str | None,
     base_url: str = DEFAULT_BASE_URL,
     max_turns: int = 20,
+    wait_for_eviction: bool = False,
+    eviction_timeout: float = 120.0,
 ) -> None:
     # Check server health
     try:
@@ -180,6 +237,13 @@ def simulate(
         f"Agent LLM: {cfg['agent_llm']}  |  "
         f"User LLM: {cfg['user_llm']}"
     )
+    session_ttl = cfg.get("session_ttl", 0)
+    if session_ttl > 0:
+        print(
+            f"Session TTL: {session_ttl}s (server will evict idle sessions automatically)"
+        )
+    else:
+        print("Session TTL: disabled")
 
     # A session is always required so the environment stays alive across turns.
     # When using --scenario (no task_id), we still need a task to initialise
@@ -195,45 +259,82 @@ def simulate(
 
     history: list[dict] = []
 
-    try:
-        for _turn in range(max_turns):
-            # ── Agent turn ────────────────────────────────────────────────
-            # /v1/agent/turn handles the full LLM→tool→LLM loop internally.
-            agent_turn = call_agent_turn(base_url, session_id, history)
-            agent_stop = agent_turn.get("is_stop", False)
+    for _turn in range(max_turns):
+        # ── Agent turn ────────────────────────────────────────────────
+        # /v1/agent/turn handles the full LLM→tool→LLM loop internally.
+        agent_turn = call_agent_turn(base_url, session_id, history)
+        agent_stop = agent_turn.get("is_stop", False)
 
-            print_agent_turn(agent_turn)
-            history.extend(history_from_agent_turn(agent_turn))
+        print_agent_turn(agent_turn)
+        history.extend(history_from_agent_turn(agent_turn))
 
-            if agent_stop:
-                print("\n[Simulation ended: agent signalled stop]")
-                break
+        if agent_stop:
+            print("\n[Simulation ended: agent signalled stop]")
+            break
 
-            # ── User turn ─────────────────────────────────────────────────
-            user_resp = call_user(
-                base_url, session_id, history, task_id=task_id, scenario=scenario
+        # ── User turn ─────────────────────────────────────────────────
+        user_resp = call_user(
+            base_url, session_id, history, task_id=task_id, scenario=scenario
+        )
+        user_msg = user_resp["choices"][0]["message"]
+        user_msg["role"] = "user"
+        user_stop = user_resp.get("is_stop", False)
+
+        history.append(user_msg)
+        print_user_turn(user_msg, user_stop)
+
+        if user_stop:
+            print("\n[Simulation ended: user signalled stop]")
+            break
+    else:
+        print(f"\n[Simulation ended: reached max turns ({max_turns})]")
+
+    # Session is intentionally NOT deleted here.  The server will evict it
+    # automatically once the TTL expires.  Use GET /v1/session/{id} to check.
+    print(f"\n[Session {session_id} left on server (TTL-based eviction)]")
+    if session_ttl > 0:
+        print(
+            f"  It will be evicted automatically after ~{session_ttl}s of inactivity."
+        )
+    print(f"  Check manually: GET {base_url}/v1/session/{session_id}")
+
+    if wait_for_eviction:
+        if session_ttl <= 0:
+            print(
+                "\nWARNING: --wait-for-eviction has no effect when the server's "
+                "session_ttl is 0 (eviction disabled). Start the server with "
+                "--session-ttl <seconds> to enable it."
             )
-            user_msg = user_resp["choices"][0]["message"]
-            user_msg["role"] = "user"
-            user_stop = user_resp.get("is_stop", False)
-
-            history.append(user_msg)
-            print_user_turn(user_msg, user_stop)
-
-            if user_stop:
-                print("\n[Simulation ended: user signalled stop]")
-                break
         else:
-            print(f"\n[Simulation ended: reached max turns ({max_turns})]")
-
-    finally:
-        if session_id:
-            delete_session(base_url, session_id)
-            print(f"\n[Session {session_id} deleted]")
+            _poll_for_eviction(base_url, session_id, eviction_timeout)
 
     print("\n" + "=" * 60)
     print("Full history:")
     print(json.dumps(history, indent=2))
+
+
+def _poll_for_eviction(base_url: str, session_id: str, timeout: float = 120.0) -> None:
+    """Poll until the session disappears or timeout elapses."""
+    poll_interval = 2.0
+    deadline = time.time() + timeout
+    print(
+        f"\n[Waiting for TTL eviction of session {session_id} "
+        f"(polling every {poll_interval:.0f}s, timeout {timeout:.0f}s)...]"
+    )
+    while time.time() < deadline:
+        alive = session_alive(base_url, session_id)
+        if not alive:
+            print(
+                f"[Session {session_id} has been evicted by the server (TTL expired)]"
+            )
+            return
+        remaining = deadline - time.time()
+        print(
+            f"  Session still alive. Checking again in {poll_interval:.0f}s "
+            f"({remaining:.0f}s remaining)..."
+        )
+        time.sleep(poll_interval)
+    print(f"[Timeout: session {session_id} is still alive after {timeout:.0f}s]")
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +367,25 @@ def main():
         default=DEFAULT_BASE_URL,
         help=f"Chat server base URL. Default: {DEFAULT_BASE_URL}.",
     )
+    parser.add_argument(
+        "--wait-for-eviction",
+        action="store_true",
+        help=(
+            "After the conversation ends, poll GET /v1/session/{id} every 2s "
+            "until the server evicts the session (TTL expired) or "
+            "--eviction-timeout elapses.  Requires the server to be started "
+            "with --session-ttl <N>."
+        ),
+    )
+    parser.add_argument(
+        "--eviction-timeout",
+        type=float,
+        default=120.0,
+        help=(
+            "Maximum seconds to wait for eviction when --wait-for-eviction is "
+            "set. Default: 120."
+        ),
+    )
     args = parser.parse_args()
 
     simulate(
@@ -273,6 +393,8 @@ def main():
         scenario=args.scenario,
         base_url=args.base_url,
         max_turns=args.max_turns,
+        wait_for_eviction=args.wait_for_eviction,
+        eviction_timeout=args.eviction_timeout,
     )
 
 

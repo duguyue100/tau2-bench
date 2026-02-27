@@ -10,6 +10,10 @@ and tool execution:
       keeps it alive for the lifetime of the session. Required when the agent
       will make tool calls.
 
+  GET /v1/session/{session_id}
+      Check whether a session is still alive. Returns 200 with metadata if it
+      exists, 404 if it has been evicted or never created.
+
   DELETE /v1/session/{session_id}
       Destroy a session and free its resources.
 
@@ -51,6 +55,13 @@ Typical simple flow using /v1/agent/turn
 6. Repeat from step 4 until is_stop==True or max turns reached.
 7. DELETE /v1/session/{session_id}
 
+Session lifecycle
+-----------------
+Sessions are stored in memory for the lifetime of the server process.
+They are evicted automatically after ``session_ttl`` seconds of inactivity
+(configurable via ``--session-ttl``; set to 0 to disable). You can also
+delete a session explicitly with DELETE /v1/session/{session_id}.
+
 Stop signals
 ------------
 - Agent stop: response content contains "###STOP###" or "###TRANSFER###"
@@ -58,6 +69,7 @@ Stop signals
               "###OUT-OF-SCOPE###"
 """
 
+import asyncio
 import time
 import uuid
 from copy import deepcopy
@@ -112,6 +124,13 @@ class ChatServerConfig(BaseModel):
     user_llm_args: dict = Field(
         default_factory=lambda: deepcopy(DEFAULT_LLM_ARGS_USER),
         description="Extra kwargs forwarded to the user LLM.",
+    )
+    session_ttl: int = Field(
+        default=3600,
+        description=(
+            "Seconds of inactivity after which a session is automatically evicted. "
+            "Set to 0 to disable auto-eviction."
+        ),
     )
 
 
@@ -239,6 +258,20 @@ class SessionInfo(BaseModel):
     session_id: str = Field(description="Opaque session identifier.")
     task_id: str = Field(description="Task ID this session was created for.")
     domain: str = Field(description="Domain the session is running in.")
+
+
+class SessionStatus(BaseModel):
+    """Response from GET /v1/session/{session_id}."""
+
+    session_id: str = Field(description="Opaque session identifier.")
+    task_id: str = Field(description="Task ID this session was created for.")
+    domain: str = Field(description="Domain the session is running in.")
+    last_accessed: float = Field(
+        description="Unix timestamp of the last activity on this session."
+    )
+    alive: bool = Field(
+        default=True, description="Always True when the session exists."
+    )
 
 
 class ToolCallInput(BaseModel):
@@ -687,6 +720,25 @@ def _run_user(
 # ---------------------------------------------------------------------------
 
 
+def _evict_once(sessions: dict[str, dict], session_ttl: int) -> list[str]:
+    """Evict sessions idle for longer than *session_ttl* seconds.
+
+    No-op when *session_ttl* is 0 (disabled).  Returns the list of evicted
+    session IDs — useful for testing.
+    """
+    if session_ttl <= 0:
+        return []
+    now = time.time()
+    stale = [
+        sid
+        for sid, data in list(sessions.items())
+        if now - data["last_accessed"] > session_ttl
+    ]
+    for sid in stale:
+        sessions.pop(sid, None)
+    return stale
+
+
 def create_app(config: ChatServerConfig) -> FastAPI:
     """
     Create and return a FastAPI application configured for *config*.
@@ -715,9 +767,31 @@ def create_app(config: ChatServerConfig) -> FastAPI:
         return config
 
     # -----------------------------------------------------------------------
-    # Session store: session_id -> {"environment": Environment, "task_id": str}
+    # Session store: session_id -> {"environment": Environment, "task_id": str,
+    #                                "last_accessed": float}
+    # Sessions are evicted after config.session_ttl seconds of inactivity
+    # (when session_ttl > 0).
+    # The store is also exposed on app.state.sessions for testability.
     # -----------------------------------------------------------------------
     sessions: dict[str, dict] = {}
+    app.state.sessions = sessions  # expose for tests / introspection
+
+    async def _evict_stale_sessions() -> None:
+        """Background task: remove sessions idle for longer than session_ttl.
+
+        The sweep interval is capped at 60s but reduced to half the TTL when
+        the TTL is short, so short-lived sessions are evicted promptly.
+        """
+        sweep_interval = (
+            min(60, max(1, config.session_ttl // 2)) if config.session_ttl > 0 else 60
+        )
+        while True:
+            await asyncio.sleep(sweep_interval)
+            _evict_once(sessions, config.session_ttl)
+
+    @app.on_event("startup")
+    async def _startup() -> None:
+        asyncio.create_task(_evict_stale_sessions())
 
     @app.post("/v1/session", status_code=201)
     def create_session(request: CreateSessionRequest) -> SessionInfo:
@@ -751,6 +825,7 @@ def create_app(config: ChatServerConfig) -> FastAPI:
             sessions[session_id] = {
                 "environment": environment,
                 "task_id": request.task_id,
+                "last_accessed": time.time(),
             }
             return SessionInfo(
                 session_id=session_id,
@@ -761,6 +836,29 @@ def create_app(config: ChatServerConfig) -> FastAPI:
             raise
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
+
+    @app.get("/v1/session/{session_id}")
+    def get_session(session_id: str) -> SessionStatus:
+        """
+        Check whether a session is still alive.
+
+        Returns 200 with session metadata if the session exists, or 404 if it
+        has been evicted (TTL expired) or was never created.  Useful for
+        detecting TTL-based eviction without waiting for a tool/agent request
+        to fail.
+        """
+        if session_id not in sessions:
+            raise HTTPException(
+                status_code=404, detail=f"Session '{session_id}' not found."
+            )
+        data = sessions[session_id]
+        return SessionStatus(
+            session_id=session_id,
+            task_id=data["task_id"],
+            domain=config.domain,
+            last_accessed=data["last_accessed"],
+            alive=True,
+        )
 
     @app.delete("/v1/session/{session_id}", status_code=204)
     def delete_session(session_id: str) -> None:
@@ -788,6 +886,7 @@ def create_app(config: ChatServerConfig) -> FastAPI:
         try:
             import json as _json
 
+            sessions[request.session_id]["last_accessed"] = time.time()
             environment: Environment = sessions[request.session_id]["environment"]
             results: list[ToolResultMessage] = []
 
@@ -868,6 +967,7 @@ def create_app(config: ChatServerConfig) -> FastAPI:
         try:
             from tau2.user.base import OUT_OF_SCOPE, STOP, TRANSFER
 
+            sessions[request.session_id]["last_accessed"] = time.time()
             environment: Environment = sessions[request.session_id]["environment"]
 
             # Working copy of the message history – extended as tools execute
@@ -1012,6 +1112,7 @@ def create_app(config: ChatServerConfig) -> FastAPI:
                         detail=f"Session '{request.session_id}' not found.",
                     )
                 environment = sessions[request.session_id]["environment"]
+                sessions[request.session_id]["last_accessed"] = time.time()
 
             assistant_msg = _run_agent(
                 config, request.messages, environment=environment
@@ -1055,6 +1156,7 @@ def create_app(config: ChatServerConfig) -> FastAPI:
                         detail=f"Session '{request.session_id}' not found.",
                     )
                 environment = sessions[request.session_id]["environment"]
+                sessions[request.session_id]["last_accessed"] = time.time()
 
             scenario = _resolve_scenario(config, request)
             user_msg = _run_user(

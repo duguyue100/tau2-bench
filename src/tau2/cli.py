@@ -269,6 +269,15 @@ def main():
         default=8002,
         help="Port to run the server on. Default is 8002.",
     )
+    chat_server_parser.add_argument(
+        "--session-ttl",
+        type=int,
+        default=3600,
+        help=(
+            "Seconds of inactivity after which a session is automatically evicted. "
+            "Set to 0 to disable auto-eviction. Default is 3600 (1 hour)."
+        ),
+    )
     chat_server_parser.set_defaults(
         func=lambda args: run_chat_server(
             domain=args.domain,
@@ -278,6 +287,7 @@ def main():
             user_llm_args=args.user_llm_args,
             host=args.host,
             port=args.port,
+            session_ttl=args.session_ttl,
         )
     )
 
@@ -461,6 +471,7 @@ def run_chat_server(
     user_llm_args: dict | None = None,
     host: str = "127.0.0.1",
     port: int = 8002,
+    session_ttl: int = 3600,
 ):
     import uvicorn
 
@@ -472,6 +483,7 @@ def run_chat_server(
         agent_llm_args=agent_llm_args or {"temperature": DEFAULT_LLM_TEMPERATURE_AGENT},
         user_llm=user_llm,
         user_llm_args=user_llm_args or {"temperature": DEFAULT_LLM_TEMPERATURE_USER},
+        session_ttl=session_ttl,
     )
     uvicorn.run(create_app(config), host=host, port=port)
 
