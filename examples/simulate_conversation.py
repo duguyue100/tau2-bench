@@ -15,18 +15,17 @@ Conversation flow
 1. POST /v1/session        {"task_id": "3"}
    -> {"session_id": "..."}   (initialises environment with task's initial_state)
 
-2. POST /v1/agent/chat/completions  {"session_id": "...", "messages": []}
-   -> Agent sends opening greeting.
+2. POST /v1/agent/turn  {"session_id": "...", "messages": []}
+   -> Agent sends opening greeting (no tools called on first turn).
 
 3. POST /v1/user/chat/completions   {"session_id": "...", "task_id": "3",
                                      "messages": [agent greeting]}
    -> User simulator replies.
 
-4. POST /v1/agent/chat/completions  {"session_id": "...", "messages": [...]}
-   -> Agent responds.
-   If finish_reason == "tool_calls":
-     POST /v1/tool/execute  {"session_id": "...", "tool_calls": [...]}
-     -> Append role="tool" messages to history, call agent endpoint again.
+4. POST /v1/agent/turn  {"session_id": "...", "messages": [...]}
+   -> Server runs the full agent turn internally (LLM → tool calls → LLM → …)
+      and returns the final text message plus all intermediate tool steps.
+   -> Append steps[*].tool_calls + steps[*].tool_results + final_message to history.
 
 5. Repeat from step 3 until is_stop == True or max turns reached.
 
@@ -64,11 +63,12 @@ def delete_session(base_url: str, session_id: str) -> None:
     requests.delete(f"{base_url}/v1/session/{session_id}", timeout=10)
 
 
-def call_agent(base_url: str, session_id: str, messages: list[dict]) -> dict:
+def call_agent_turn(base_url: str, session_id: str, messages: list[dict]) -> dict:
+    """Run a full agent turn (LLM + tool loops) in one request."""
     return call(
         "POST",
         base_url,
-        "/v1/agent/chat/completions",
+        "/v1/agent/turn",
         json={"session_id": session_id, "messages": messages},
     )
 
@@ -88,52 +88,70 @@ def call_user(
     return call("POST", base_url, "/v1/user/chat/completions", json=body)
 
 
-def execute_tools(base_url: str, session_id: str, tool_calls: list[dict]) -> list[dict]:
-    """Execute tool calls and return a list of role='tool' message dicts."""
-    data = call(
-        "POST",
-        base_url,
-        "/v1/tool/execute",
-        json={"session_id": session_id, "tool_calls": tool_calls},
-    )
-    # Convert ToolResultMessage objects into OpenAI-style tool messages
-    tool_msgs = []
-    for r in data["results"]:
-        tool_msgs.append(
-            {
-                "role": "tool",
-                "tool_call_id": r["tool_call_id"],
-                "content": r["content"],
-                "requestor": r["requestor"],
-            }
-        )
-    return tool_msgs
-
-
 # ---------------------------------------------------------------------------
 # Display helpers
 # ---------------------------------------------------------------------------
 
 
-def print_turn(role: str, msg: dict, is_stop: bool = False) -> None:
+def print_agent_turn(turn: dict) -> None:
+    """Print a /v1/agent/turn response."""
+    is_stop = turn.get("is_stop", False)
+    # Print intermediate tool steps
+    for i, step in enumerate(turn.get("steps", []), 1):
+        print(f"\n[AGENT - tool round {i}]")
+        for tc in step.get("tool_calls", []):
+            fn = tc.get("function", {})
+            print(f"  -> {fn.get('name')}({fn.get('arguments')})")
+        print("  [ENV results]")
+        for r in step.get("tool_results", []):
+            error_tag = " [ERROR]" if r.get("error") else ""
+            print(f"    tool_call_id={r['tool_call_id']}{error_tag}: {r['content']}")
+    # Final message
     stop_tag = "  [STOP]" if is_stop else ""
-    print(f"\n[{role.upper()}]{stop_tag}")
+    print(f"\n[AGENT]{stop_tag}")
+    content = turn.get("final_message", {}).get("content")
+    if content:
+        print(f"  {content}")
+
+
+def print_user_turn(msg: dict, is_stop: bool = False) -> None:
+    stop_tag = "  [STOP]" if is_stop else ""
+    print(f"\n[USER]{stop_tag}")
     content = msg.get("content")
     if content:
         print(f"  {content}")
-    tool_calls = msg.get("tool_calls")
-    if tool_calls:
-        print("  Tool calls:")
-        for tc in tool_calls:
-            fn = tc.get("function", {})
-            print(f"    -> {fn.get('name')}({fn.get('arguments')})")
 
 
-def print_tool_results(results: list[dict]) -> None:
-    print("\n[ENV]")
-    for r in results:
-        error_tag = " [ERROR]" if r.get("error") else ""
-        print(f"  tool_call_id={r['tool_call_id']}{error_tag}: {r['content']}")
+# ---------------------------------------------------------------------------
+# Build history from an agent turn response
+# ---------------------------------------------------------------------------
+
+
+def history_from_agent_turn(turn: dict) -> list[dict]:
+    """Return the list of messages to append to history from a turn response."""
+    msgs = []
+    for step in turn.get("steps", []):
+        # assistant message with tool_calls
+        msgs.append(
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": step["tool_calls"],
+            }
+        )
+        # tool result messages
+        for r in step["tool_results"]:
+            msgs.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": r["tool_call_id"],
+                    "content": r["content"],
+                    "requestor": r["requestor"],
+                }
+            )
+    # Final text message
+    msgs.append(turn["final_message"])
+    return msgs
 
 
 # ---------------------------------------------------------------------------
@@ -180,37 +198,12 @@ def simulate(
     try:
         for _turn in range(max_turns):
             # ── Agent turn ────────────────────────────────────────────────
-            agent_resp = call_agent(base_url, session_id, history)
-            agent_msg = agent_resp["choices"][0]["message"]
-            agent_stop = agent_resp.get("is_stop", False)
-            finish_reason = agent_resp["choices"][0]["finish_reason"]
+            # /v1/agent/turn handles the full LLM→tool→LLM loop internally.
+            agent_turn = call_agent_turn(base_url, session_id, history)
+            agent_stop = agent_turn.get("is_stop", False)
 
-            history.append(agent_msg)
-            print_turn("agent", agent_msg, agent_stop)
-
-            if agent_stop:
-                print("\n[Simulation ended: agent signalled stop]")
-                break
-
-            # Execute tool calls if the agent requested them
-            while finish_reason == "tool_calls":
-                tool_results = execute_tools(
-                    base_url, session_id, agent_msg["tool_calls"]
-                )
-                print_tool_results(tool_results)
-                history.extend(tool_results)
-
-                # Let agent continue after seeing tool results
-                agent_resp = call_agent(base_url, session_id, history)
-                agent_msg = agent_resp["choices"][0]["message"]
-                agent_stop = agent_resp.get("is_stop", False)
-                finish_reason = agent_resp["choices"][0]["finish_reason"]
-
-                history.append(agent_msg)
-                print_turn("agent", agent_msg, agent_stop)
-
-                if agent_stop:
-                    break
+            print_agent_turn(agent_turn)
+            history.extend(history_from_agent_turn(agent_turn))
 
             if agent_stop:
                 print("\n[Simulation ended: agent signalled stop]")
@@ -225,7 +218,7 @@ def simulate(
             user_stop = user_resp.get("is_stop", False)
 
             history.append(user_msg)
-            print_turn("user", user_msg, user_stop)
+            print_user_turn(user_msg, user_stop)
 
             if user_stop:
                 print("\n[Simulation ended: user signalled stop]")

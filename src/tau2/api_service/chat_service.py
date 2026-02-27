@@ -23,26 +23,33 @@ and tool execution:
       (system + user/assistant/tool messages) and receive the agent's next
       response, which may contain tool calls.
 
+  POST /v1/agent/turn
+      High-level agent turn: runs the full LLM → tool-execute → LLM → …
+      loop internally until the agent produces a final text message (or a
+      stop signal).  Returns the final assistant message together with all
+      intermediate tool calls and tool results that occurred during the turn,
+      so the caller can append everything to their history.
+
   POST /v1/user/chat/completions
       Plays the user simulator.  Pass the full conversation so far plus
       either a task_id or a raw scenario string; receive the user's next
       response.
 
-Typical step-by-step flow (with tool execution)
--------------------------------------------------
+Typical simple flow using /v1/agent/turn
+-----------------------------------------
 1. Start the server: tau2 chat-server --domain airline --agent-llm gpt-4.1 ...
 2. POST /v1/session  {"task_id": "3"}
    -> {"session_id": "..."}
-3. POST /v1/agent/chat/completions  {"session_id": "...", "messages": []}
-   -> Agent sends greeting ("Hi! How can I help you today?").
+3. POST /v1/agent/turn  {"session_id": "...", "messages": []}
+   -> Agent sends greeting.
 4. POST /v1/user/chat/completions   {"session_id": "...", "task_id": "3",
                                      "messages": [agent greeting]}
    -> User replies.
-5. POST /v1/agent/chat/completions  {"session_id": "...", "messages": [...]}
-   -> Agent responds. If finish_reason=="tool_calls":
-6.   POST /v1/tool/execute  {"session_id": "...", "tool_calls": [...]}
-     -> Append returned role="tool" messages to history. Go to step 5.
-7. When is_stop==True, optionally DELETE /v1/session/{session_id}.
+5. POST /v1/agent/turn  {"session_id": "...", "messages": [...]}
+   -> Agent completes its full turn (including any tool calls) and returns
+      the final message plus all intermediate steps.
+6. Repeat from step 4 until is_stop==True or max turns reached.
+7. DELETE /v1/session/{session_id}
 
 Stop signals
 ------------
@@ -311,6 +318,46 @@ class ChatCompletionResponse(BaseModel):
     choices: list[Choice]
     usage: UsageInfo = Field(default_factory=UsageInfo)
     # tau2-specific: True when the response contains a stop signal
+    is_stop: bool = False
+
+
+class AgentTurnStep(BaseModel):
+    """One tool-call/result pair that occurred during an agent turn."""
+
+    tool_calls: list[ToolCallOutput] = Field(
+        description="Tool calls the agent made in this step."
+    )
+    tool_results: list[ToolResultMessage] = Field(
+        description="Results returned by the environment for those tool calls."
+    )
+
+
+class AgentTurnResponse(BaseModel):
+    """Response from POST /v1/agent/turn.
+
+    Contains the final assistant message (after all tool loops have completed)
+    plus the full list of intermediate steps so the caller can reconstruct the
+    complete message history if needed.
+    """
+
+    id: str = Field(default_factory=lambda: f"chatcmpl-{uuid.uuid4().hex[:24]}")
+    object: Literal["agent.turn"] = "agent.turn"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    model: str
+    # All tool-call/result rounds that happened before the final message
+    steps: list[AgentTurnStep] = Field(
+        default_factory=list,
+        description="Intermediate tool-call / tool-result rounds (may be empty).",
+    )
+    # The final text message from the agent
+    final_message: ChoiceMessage = Field(
+        description="The agent's final text message after all tool loops."
+    )
+    finish_reason: str = Field(
+        default="stop",
+        description="Always 'stop' – tool loops are resolved internally.",
+    )
+    usage: UsageInfo = Field(default_factory=UsageInfo)
     is_stop: bool = False
 
 
@@ -772,6 +819,165 @@ def create_app(config: ChatServerConfig) -> FastAPI:
                 )
 
             return ExecuteToolsResponse(results=results)
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/v1/agent/turn")
+    async def agent_turn(request: AgentChatRequest) -> AgentTurnResponse:
+        """
+        Run a **complete agent turn** — including all tool-call loops — and
+        return the final text message together with every intermediate step.
+
+        This is the high-level alternative to calling
+        `POST /v1/agent/chat/completions` + `POST /v1/tool/execute` in a loop.
+        The server handles the full cycle internally:
+
+        ```
+        LLM call
+          └─ if tool_calls → execute tools → LLM call again (repeat)
+          └─ if stop       → return final_message
+        ```
+
+        A `session_id` (from `POST /v1/session`) is required so that tool
+        calls execute against the correct live environment.
+
+        **Response fields**
+        - `steps`: list of `{tool_calls, tool_results}` rounds (empty when no
+          tools were called).
+        - `final_message`: the agent's concluding text message.
+        - `is_stop`: `True` when the message contains a stop signal.
+
+        Append `steps[*].tool_calls + steps[*].tool_results + final_message`
+        to your conversation history after each call.
+        """
+        import json as _json
+
+        if request.session_id is None:
+            raise HTTPException(
+                status_code=422,
+                detail="'session_id' is required for /v1/agent/turn.",
+            )
+        if request.session_id not in sessions:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Session '{request.session_id}' not found.",
+            )
+
+        try:
+            from tau2.user.base import OUT_OF_SCOPE, STOP, TRANSFER
+
+            environment: Environment = sessions[request.session_id]["environment"]
+
+            # Working copy of the message history – extended as tools execute
+            current_messages = list(request.messages)
+            steps: list[AgentTurnStep] = []
+            total_usage = UsageInfo()
+
+            while True:
+                assistant_msg = _run_agent(
+                    config, current_messages, environment=environment
+                )
+
+                # Accumulate usage
+                if assistant_msg.usage:
+                    total_usage.prompt_tokens += assistant_msg.usage.get(
+                        "prompt_tokens", 0
+                    )
+                    total_usage.completion_tokens += assistant_msg.usage.get(
+                        "completion_tokens", 0
+                    )
+                    total_usage.total_tokens += assistant_msg.usage.get(
+                        "total_tokens", 0
+                    )
+
+                if not assistant_msg.tool_calls:
+                    # Final text message – exit loop
+                    content = assistant_msg.content or ""
+                    is_stop = (
+                        STOP in content
+                        or TRANSFER in content
+                        or OUT_OF_SCOPE in content
+                    )
+
+                    # Build ChoiceMessage for the final message
+                    final_msg = ChoiceMessage(
+                        role="assistant",
+                        content=assistant_msg.content,
+                        tool_calls=None,
+                    )
+                    return AgentTurnResponse(
+                        model=config.agent_llm,
+                        steps=steps,
+                        final_message=final_msg,
+                        finish_reason="stop",
+                        usage=total_usage,
+                        is_stop=is_stop,
+                    )
+
+                # ── Tool-call round ──────────────────────────────────────────
+                # Serialise the tool calls to OpenAI format
+                tc_outputs: list[ToolCallOutput] = []
+                for tc in assistant_msg.tool_calls:
+                    tc_outputs.append(
+                        ToolCallOutput(
+                            id=tc.id or f"call_{uuid.uuid4().hex[:16]}",
+                            function=FunctionCall(
+                                name=tc.name,
+                                arguments=_json.dumps(tc.arguments),
+                            ),
+                        )
+                    )
+
+                # Execute each tool call against the live environment
+                tool_results: list[ToolResultMessage] = []
+                for tc in assistant_msg.tool_calls:
+                    tool_msg: ToolMessage = environment.get_response(tc)
+                    tool_results.append(
+                        ToolResultMessage(
+                            tool_call_id=tool_msg.id,
+                            content=tool_msg.content or "",
+                            requestor=tool_msg.requestor,
+                            error=tool_msg.error,
+                        )
+                    )
+
+                steps.append(
+                    AgentTurnStep(tool_calls=tc_outputs, tool_results=tool_results)
+                )
+
+                # Extend working history: assistant message with tool_calls +
+                # the tool result messages, so the next LLM call sees them.
+                assistant_dict: dict = {
+                    "role": "assistant",
+                    "content": assistant_msg.content,
+                    "tool_calls": [
+                        {
+                            "id": tco.id,
+                            "type": "function",
+                            "function": {
+                                "name": tco.function.name,
+                                "arguments": tco.function.arguments,
+                            },
+                        }
+                        for tco in tc_outputs
+                    ],
+                }
+                current_messages = (
+                    current_messages
+                    + [ChatMessageInput(**assistant_dict)]
+                    + [
+                        ChatMessageInput(
+                            role="tool",
+                            tool_call_id=r.tool_call_id,
+                            content=r.content,
+                            requestor=r.requestor,
+                        )
+                        for r in tool_results
+                    ]
+                )
+
         except HTTPException:
             raise
         except Exception as e:
