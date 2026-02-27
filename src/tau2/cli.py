@@ -219,6 +219,68 @@ def main():
     start_parser = subparsers.add_parser("start", help="Start all servers")
     start_parser.set_defaults(func=lambda args: run_start_servers())
 
+    # Chat-server command
+    chat_server_parser = subparsers.add_parser(
+        "chat-server",
+        help="Start a step-by-step chat simulation server with OpenAI-compatible endpoints",
+    )
+    domains = get_options().domains
+    chat_server_parser.add_argument(
+        "--domain",
+        "-d",
+        type=str,
+        required=True,
+        choices=domains,
+        help="The domain to simulate.",
+    )
+    chat_server_parser.add_argument(
+        "--agent-llm",
+        type=str,
+        default=DEFAULT_LLM_AGENT,
+        help=f"The LLM to use for the agent. Default is {DEFAULT_LLM_AGENT}.",
+    )
+    chat_server_parser.add_argument(
+        "--agent-llm-args",
+        type=json.loads,
+        default={"temperature": DEFAULT_LLM_TEMPERATURE_AGENT},
+        help=f"The arguments to pass to the agent LLM as a JSON string. Default is '{{\"temperature\": {DEFAULT_LLM_TEMPERATURE_AGENT}}}'.",
+    )
+    chat_server_parser.add_argument(
+        "--user-llm",
+        type=str,
+        default=DEFAULT_LLM_USER,
+        help=f"The LLM to use for the user simulator. Default is {DEFAULT_LLM_USER}.",
+    )
+    chat_server_parser.add_argument(
+        "--user-llm-args",
+        type=json.loads,
+        default={"temperature": DEFAULT_LLM_TEMPERATURE_USER},
+        help=f"The arguments to pass to the user LLM as a JSON string. Default is '{{\"temperature\": {DEFAULT_LLM_TEMPERATURE_USER}}}'.",
+    )
+    chat_server_parser.add_argument(
+        "--host",
+        type=str,
+        default="127.0.0.1",
+        help="Host to bind the server to. Default is 127.0.0.1.",
+    )
+    chat_server_parser.add_argument(
+        "--port",
+        type=int,
+        default=8002,
+        help="Port to run the server on. Default is 8002.",
+    )
+    chat_server_parser.set_defaults(
+        func=lambda args: run_chat_server(
+            domain=args.domain,
+            agent_llm=args.agent_llm,
+            agent_llm_args=args.agent_llm_args,
+            user_llm=args.user_llm,
+            user_llm_args=args.user_llm_args,
+            host=args.host,
+            port=args.port,
+        )
+    )
+
     # Check data command
     check_data_parser = subparsers.add_parser(
         "check-data", help="Check if data directory is properly configured"
@@ -389,6 +451,29 @@ def run_manual_mode():
     from tau2.scripts.manual_mode import main as manual_main
 
     manual_main()
+
+
+def run_chat_server(
+    domain: str,
+    agent_llm: str = DEFAULT_LLM_AGENT,
+    agent_llm_args: dict | None = None,
+    user_llm: str = DEFAULT_LLM_USER,
+    user_llm_args: dict | None = None,
+    host: str = "127.0.0.1",
+    port: int = 8002,
+):
+    import uvicorn
+
+    from tau2.api_service.chat_service import ChatServerConfig, create_app
+
+    config = ChatServerConfig(
+        domain=domain,
+        agent_llm=agent_llm,
+        agent_llm_args=agent_llm_args or {"temperature": DEFAULT_LLM_TEMPERATURE_AGENT},
+        user_llm=user_llm,
+        user_llm_args=user_llm_args or {"temperature": DEFAULT_LLM_TEMPERATURE_USER},
+    )
+    uvicorn.run(create_app(config), host=host, port=port)
 
 
 if __name__ == "__main__":
