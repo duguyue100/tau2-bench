@@ -194,6 +194,82 @@ tau2 check-data
 ```
 This command checks if your data directory is properly configured and all required files are present.
 
+### Interactive agent/user chat API
+
+If you want to drive the conversation step-by-step yourself (instead of running full `tau2 run`), start the interactive chat API:
+
+```bash
+tau2 chat-server --host 127.0.0.1 --port 8005
+```
+
+You can also load default agent/user configuration from a file:
+
+```bash
+tau2 chat-server --host 127.0.0.1 --port 8005 --config interactive_chat_server.example.toml
+```
+
+Config format is demonstrated in `interactive_chat_server.example.toml`. The server applies defaults from:
+- `[agent_session_defaults]` for `POST /v1/agent/sessions`
+- `[user_session_defaults]` for `POST /v1/user/sessions`
+- `[relay_session_defaults]` for `POST /v1/relay/sessions`
+
+In relay mode, `agent_llm`/`user_llm` defaults are ignored because both turns are supplied externally.
+
+Any values sent in the session creation request override config defaults.
+
+This service provides two OpenAI-like chat endpoints with in-memory sessions:
+
+- `POST /v1/agent/sessions`: create a session where **you control the agent** and tau2 runs the user simulator.
+- `POST /v1/user/sessions`: create a session where **you control the user** and tau2 runs the LLM agent.
+- `POST /v1/agent/chat/completions`: advance an agent-controlled session by one step.
+- `POST /v1/user/chat/completions`: advance a user-controlled session by one step.
+
+It also supports a shared relay mode if you want to control **both** sides externally:
+
+- `POST /v1/relay/sessions`: create one shared session (single conversation state).
+- `POST /v1/relay/user/chat/completions`: submit the next user turn.
+- `POST /v1/relay/agent/chat/completions`: submit the next agent turn.
+
+Relay responses include `next_turn` (`"user"` or `"agent"`) so your client can alternate calls correctly.
+Relay session creation (`/v1/relay/sessions`) also returns selected task context in `info` (policy, user scenario, and tool schemas), which external clients can use to ground model behavior.
+
+If you want endpoint behavior equivalent to `tau2 run` (both agent and user generated internally by tau2), use:
+
+- `POST /v1/simulations/runs`: run a full simulation and return transcript + reward in one response.
+
+An end-to-end relay client example is available at `examples/relay_client.py`.
+
+Create an agent-controlled session:
+
+```bash
+curl -X POST http://127.0.0.1:8005/v1/agent/sessions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "domain": "mock",
+    "task_id": "create_task_1"
+  }'
+```
+
+Advance one step (agent message -> user response):
+
+```bash
+curl -X POST http://127.0.0.1:8005/v1/agent/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "session_id": "session-...",
+    "messages": [
+      {"role": "assistant", "content": "Hello! How can I help you today?"}
+    ]
+  }'
+```
+
+Notes:
+- Endpoints are stateful by `session_id` and keep simulation state in memory.
+- `stream=true` is not supported.
+- For tool calls, provide OpenAI-style `tool_calls` in the last message (one tool call per step).
+- Session creation accepts `full_observation` (default `true`). Set it to `false` to return compact observations instead of full transcript history.
+- If you configure defaults via `--config`, you can inspect active defaults at `GET /v1/config`.
+
 ## Leaderboard Submission
 
 To submit your agent results to the τ²-bench leaderboard, you need to prepare a valid submission package that meets specific requirements.

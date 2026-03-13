@@ -158,6 +158,7 @@ def main():
                 task_split_name=args.task_split_name,
                 task_ids=args.task_ids,
                 num_tasks=args.num_tasks,
+                is_remote=False,
                 agent=args.agent,
                 llm_agent=args.agent_llm,
                 llm_args_agent=args.agent_llm_args,
@@ -218,6 +219,31 @@ def main():
     # Start command
     start_parser = subparsers.add_parser("start", help="Start all servers")
     start_parser.set_defaults(func=lambda args: run_start_servers())
+
+    # Interactive chat server command
+    chat_server_parser = subparsers.add_parser(
+        "chat-server",
+        help="Start interactive agent/user chat API server",
+    )
+    chat_server_parser.add_argument(
+        "--host",
+        type=str,
+        default="127.0.0.1",
+        help="Host for the interactive chat API server.",
+    )
+    chat_server_parser.add_argument(
+        "--port",
+        type=int,
+        default=8005,
+        help="Port for the interactive chat API server.",
+    )
+    chat_server_parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to interactive chat server config file (.json/.yaml/.yml/.toml).",
+    )
+    chat_server_parser.set_defaults(func=lambda args: run_chat_server(args))
 
     # Check data command
     check_data_parser = subparsers.add_parser(
@@ -335,6 +361,12 @@ def run_start_servers():
     from tau2.scripts.start_servers import main as start_main
 
     start_main()
+
+
+def run_chat_server(args):
+    from tau2.api_service.interactive_chat_service import main as chat_server_main
+
+    chat_server_main(host=args.host, port=args.port, config_path=args.config)
 
 
 def run_check_data():
